@@ -14,7 +14,7 @@
 % Specific redis command implementation
 -export([flushdb/0]).
 
- % Helper functions
+% Helper functions
 -export([update_key/2]).
 -export([update_hash_field/3]).
 -export([optimistic_locking_transaction/3]).
@@ -89,7 +89,7 @@ transaction(Transaction, Slot, ExpectedValue, Counter) ->
 -spec qmn(redis_pipeline_command()) -> redis_pipeline_result().
 qmn(Commands) -> qmn(Commands, 0).
 
-qmn(_, ?REDIS_CLUSTER_REQUEST_TTL) -> 
+qmn(_, ?REDIS_CLUSTER_REQUEST_TTL) ->
     {error, no_connection};
 qmn(Commands, Counter) ->
     %% Throttle retries
@@ -102,11 +102,14 @@ qmn(Commands, Counter) ->
     end.
 
 qmn2([{Pool, PoolCommands} | T1], [{Pool, Mapping} | T2], Acc, Version) ->
-    Transaction = fun(Worker) -> qw(Worker, PoolCommands) end,
-    Result = eredis_cluster_pool:transaction(Pool, Transaction),
+    Worker = eredis_cluster_pool:get_worker(Pool),
+    WorkerPID = whereis(Worker),
+
+    Result = eredis:q(WorkerPID,PoolCommands,5000),
+
     case handle_transaction_result(Result, Version, check_pipeline_result) of
         retry -> retry;
-        Res -> 
+        Res ->
             MappedRes = lists:zip(Mapping,Res),
             qmn2(T1, T2, MappedRes ++ Acc, Version)
     end;
@@ -172,26 +175,27 @@ query(_, undefined) ->
     {error, invalid_cluster_command};
 query(Command, PoolKey) ->
     Slot = get_key_slot(PoolKey),
-    Transaction = fun(Worker) -> qw(Worker, Command) end,
-    query(Transaction, Slot, 0).
+    query(Command, Slot, 0).
 
 query(_, _, ?REDIS_CLUSTER_REQUEST_TTL) ->
     {error, no_connection};
-query(Transaction, Slot, Counter) ->
+query(Command, Slot, Counter) ->
     %% Throttle retries
     throttle_retries(Counter),
 
     {Pool, Version} = eredis_cluster_monitor:get_pool_by_slot(Slot),
+    Worker = eredis_cluster_pool:get_worker(Pool),
+    WorkerPID = whereis(Worker),
 
-    Result = eredis_cluster_pool:transaction(Pool, Transaction),
-    case handle_transaction_result(Result, Version) of 
-        retry -> query(Transaction, Slot, Counter + 1);
+    Result = eredis:q(WorkerPID,Command,5000),
+    case handle_transaction_result(Result, Version) of
+        retry -> query(Command, Slot, Counter + 1);
         Result -> Result
     end.
 
 handle_transaction_result(Result, Version) ->
-    case Result of 
-       % If we detect a node went down, we should probably refresh the slot
+    case Result of
+        % If we detect a node went down, we should probably refresh the slot
         % mapping.
         {error, no_connection} ->
             logger:error("eredis_cluster:handle_transaction_result <--> {error, no_connection}",[]),
@@ -222,18 +226,18 @@ handle_transaction_result(Result, Version) ->
     end.
 handle_transaction_result(Result, Version, check_pipeline_result) ->
     case handle_transaction_result(Result, Version) of
-       retry -> retry;
-       Payload when is_list(Payload) ->
-           Pred = fun({error, <<"MOVED ", _/binary>>}) -> true;
-                    (_) -> false
-                 end,
-           case lists:any(Pred, Payload) of
-               false -> Payload;
-               true ->
-                   eredis_cluster_monitor:refresh_mapping(Version),
-                   retry
-           end;
-       Payload -> Payload
+        retry -> retry;
+        Payload when is_list(Payload) ->
+            Pred = fun({error, <<"MOVED ", _/binary>>}) -> true;
+                (_) -> false
+                   end,
+            case lists:any(Pred, Payload) of
+                false -> Payload;
+                true ->
+                    eredis_cluster_monitor:refresh_mapping(Version),
+                    retry
+            end;
+        Payload -> Payload
     end.
 
 -spec throttle_retries(integer()) -> ok.
@@ -252,7 +256,7 @@ update_key(Key, UpdateFunction) ->
         {ok, Var} = GetResult,
         UpdatedVar = UpdateFunction(Var),
         {[["SET", Key, UpdatedVar]], UpdatedVar}
-    end,
+                      end,
     case optimistic_locking_transaction(Key, ["GET", Key], UpdateFunction2) of
         {ok, {_, NewValue}} ->
             {ok, NewValue};
@@ -272,7 +276,7 @@ update_hash_field(Key, Field, UpdateFunction) ->
         {ok, Var} = GetResult,
         UpdatedVar = UpdateFunction(Var),
         {[["HSET", Key, Field, UpdatedVar]], UpdatedVar}
-    end,
+                      end,
     case optimistic_locking_transaction(Key, ["HGET", Key, Field], UpdateFunction2) of
         {ok, {[FieldPresent], NewValue}} ->
             {ok, {FieldPresent, NewValue}};
@@ -287,7 +291,7 @@ update_hash_field(Key, Field, UpdateFunction) ->
 %% =============================================================================
 -spec optimistic_locking_transaction(Key::anystring(), redis_command(),
     UpdateFunction::fun((redis_result()) -> redis_pipeline_command())) ->
-        {redis_transaction_result(), any()}.
+    {redis_transaction_result(), any()}.
 optimistic_locking_transaction(WatchedKey, GetCommand, UpdateFunction) ->
     Slot = get_key_slot(WatchedKey),
     Transaction = fun(Worker) ->
@@ -297,15 +301,15 @@ optimistic_locking_transaction(WatchedKey, GetCommand, UpdateFunction) ->
         GetResult = qw(Worker, GetCommand),
         %% Execute the pipelined command as a redis transaction
         {UpdateCommand, Result} = case UpdateFunction(GetResult) of
-            {Command, Var} ->
-                {Command, Var};
-            Command ->
-                {Command, undefined}
-        end,
+                                      {Command, Var} ->
+                                          {Command, Var};
+                                      Command ->
+                                          {Command, undefined}
+                                  end,
         RedisResult = qw(Worker, [["MULTI"]] ++ UpdateCommand ++ [["EXEC"]]),
         {lists:last(RedisResult), Result}
-    end,
-	case transaction(Transaction, Slot, {ok, undefined}, ?OL_TRANSACTION_TTL) of
+                  end,
+    case transaction(Transaction, Slot, {ok, undefined}, ?OL_TRANSACTION_TTL) of
         {{ok, undefined}, _} ->
             {error, resource_busy};
         {{ok, TransactionResult}, UpdateResult} ->
@@ -326,9 +330,9 @@ eval(Script, ScriptHash, Keys, Args) ->
     KeyNb = length(Keys),
     EvalShaCommand = ["EVALSHA", ScriptHash, KeyNb] ++ Keys ++ Args,
     Key = if
-        KeyNb == 0 -> "A"; %Random key
-        true -> hd(Keys)
-    end,
+              KeyNb == 0 -> "A"; %Random key
+              true -> hd(Keys)
+          end,
 
     case qk(EvalShaCommand, Key) of
         {error, <<"NOSCRIPT", _/binary>>} ->
@@ -381,21 +385,21 @@ get_key_slot(Key) when is_bitstring(Key) ->
     get_key_slot(bitstring_to_list(Key));
 get_key_slot(Key) ->
     KeyToBeHased = case string:chr(Key,${) of
-        0 ->
-            Key;
-        Start ->
-            case string:chr(string:substr(Key,Start+1),$}) of
-                0 ->
-                    Key;
-                Length ->
-                    if
-                        Length =:= 1 ->
-                            Key;
-                        true ->
-                            string:substr(Key,Start+1,Length-1)
-                    end
-            end
-    end,
+                       0 ->
+                           Key;
+                       Start ->
+                           case string:chr(string:substr(Key,Start+1),$}) of
+                               0 ->
+                                   Key;
+                               Length ->
+                                   if
+                                       Length =:= 1 ->
+                                           Key;
+                                       true ->
+                                           string:substr(Key,Start+1,Length-1)
+                                   end
+                           end
+                   end,
     eredis_cluster_hash:hash(KeyToBeHased).
 
 %% =============================================================================
